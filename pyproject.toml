@@ -1,0 +1,20 @@
+[project]
+name = "awlak"
+version = "0.0.1"
+description = "A lightweight Python library for monitoring exceptions and custom events with rich context"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [
+    {name = "Your Name", email = "isaraovin@gmail.com"}
+]
+dependencies = [
+    "aiohttp>=3.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/isara-ovin-de/awlak"
+Repository = "https://github.com/isara-ovin-de/awlak"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
