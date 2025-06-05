@@ -1,3 +1,8 @@
+# For Awlak to send captured exception or event data to an API endpoint,
+# the `AWLAK_API_KEY` environment variable must be set.
+# If `AWLAK_API_KEY` is not set, the captured data will be printed
+# to the console by default instead of being sent to an API.
+
 import awlak
 
 def faulty_function(x):

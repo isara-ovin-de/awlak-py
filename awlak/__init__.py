@@ -7,6 +7,8 @@ import datetime
 import json
 import logging
 import asyncio
+import threading
+import atexit
 from typing import Any, Dict, Optional, List, Union
 import aiohttp
 from aiohttp import ClientSession
@@ -43,6 +45,90 @@ class Awlak:
         self.log_level: str = os.environ.get("AWLAK_LOG_LEVEL", "INFO")
 
         self._setup_logging()
+
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._own_loop: bool = False
+        self._pending_api_calls: List[asyncio.Future] = []
+
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError: # No running loop in current thread
+            pass # self._loop remains None
+
+        if self._loop is None or not self._loop.is_running():
+            self._loop = asyncio.new_event_loop()
+            self._own_loop = True
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            atexit.register(self._shutdown_loop)
+            self.logger.info("Awlak initialized with its own event loop in a separate thread.")
+        else:
+            self._own_loop = False
+            self.logger.info("Awlak initialized using an existing event loop in the current thread.")
+
+
+    def _run_loop(self) -> None:
+        """Runs the asyncio event loop."""
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _shutdown_loop(self) -> None:
+        """Gracefully shuts down the event loop and thread if Awlak created them."""
+        if not self._own_loop or not self._loop or not self._thread:
+            return
+
+        self.logger.info("Awlak shutting down its event loop...")
+
+        # Wait for pending API calls
+        # Make a copy for safe iteration as futures might be removed if they complete quickly
+        for future in list(self._pending_api_calls):
+            if not future.done():
+                try:
+                    # Wait for the future to complete with a timeout
+                    future.result(timeout=self.api_timeout + 1) # Add a bit more timeout than API
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"A task did not complete in time during shutdown: {future}")
+                except Exception as e:
+                    self.logger.error(f"Exception while waiting for task during shutdown: {e}")
+            # Remove from list if present (it might have been removed by the task itself upon completion too)
+            if future in self._pending_api_calls:
+                self._pending_api_calls.remove(future)
+
+
+        if self._loop.is_running():
+            self.logger.info("Stopping event loop...")
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+        self.logger.info("Joining event loop thread...")
+        self._thread.join(timeout=self.api_timeout + 2) # Wait for thread to finish
+        if self._thread.is_alive():
+            self.logger.warning("Event loop thread did not join cleanly.")
+
+        # Final close of the loop
+        if not self._loop.is_closed():
+             # Ensure all tasks are cancelled before closing, run_until_complete for pending tasks
+            try:
+                # Gather all remaining tasks (if any)
+                remaining_tasks = asyncio.all_tasks(loop=self._loop)
+                if remaining_tasks:
+                    self.logger.info(f"Cancelling {len(remaining_tasks)} remaining tasks before closing loop.")
+                    for task in remaining_tasks:
+                        task.cancel()
+                    # Run loop until all tasks are cancelled
+                    # self._loop.run_until_complete(asyncio.gather(*remaining_tasks, return_exceptions=True))
+                    # We need to be careful here, run_until_complete should not be called from a different thread
+                    # if the loop is already stopped. call_soon_threadsafe might be a better primitive.
+                    # For now, let's rely on the loop.stop() and thread.join().
+                    # A more robust solution might involve a more complex shutdown sequence within the loop's thread.
+                    pass # For now, rely on stop() and join()
+            except Exception as e:
+                self.logger.error(f"Error during final task cancellation: {e}")
+            finally:
+                 self._loop.close()
+
+        self.logger.info("Awlak shutdown complete.")
+
 
     def _setup_logging(self) -> None:
         """Configure logging to file and console."""
@@ -119,6 +205,10 @@ class Awlak:
             self.logger.warning("No AWLAK_API_KEY set, skipping API call")
             return False
 
+        event_type = data.get("type", "unknown_type")
+        event_title = data.get("title", "untitled_event")
+        self.logger.info(f"Starting API call process for {event_type} '{event_title}'...")
+
         async def attempt_request(session: ClientSession, retries: int) -> bool:
             for attempt in range(retries + 1):
                 try:
@@ -139,6 +229,7 @@ class Awlak:
                 if attempt < retries:
                     # Exponential backoff: 0.1s, 0.2s, 0.4s, etc.
                     await asyncio.sleep(0.1 * (2 ** attempt))
+            self.logger.error(f"API call failed for {event_type} '{event_title}' after {retries + 1} attempts.")
             return False
 
         async with aiohttp.ClientSession() as session:
@@ -204,8 +295,12 @@ class Awlak:
         if not self.api_key:
             print(self._format_output(data))
         else:
-            # Run API call in background to avoid blocking
-            asyncio.create_task(self._send_to_api(data))
+            if self._own_loop:
+                future = asyncio.run_coroutine_threadsafe(self._send_to_api(data), self._loop)
+                self._pending_api_calls.append(future)
+            else:
+                # If using an external loop, assume it's managed elsewhere
+                asyncio.create_task(self._send_to_api(data))
 
     def capture_event(self, event: Any, severity: str = INFO, **kwargs) -> None:
         """Capture and process a custom event.
@@ -236,8 +331,12 @@ class Awlak:
         if not self.api_key:
             print(self._format_output(data))
         else:
-            # Run API call in background to avoid blocking
-            asyncio.create_task(self._send_to_api(data))
+            if self._own_loop:
+                future = asyncio.run_coroutine_threadsafe(self._send_to_api(data), self._loop)
+                self._pending_api_calls.append(future)
+            else:
+                # If using an external loop, assume it's managed elsewhere
+                asyncio.create_task(self._send_to_api(data))
 
 # Singleton instance
 _instance = Awlak()
