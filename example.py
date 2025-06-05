@@ -4,6 +4,7 @@
 # to the console by default instead of being sent to an API.
 
 import awlak
+import time 
 
 def faulty_function(x):
     y = 10
@@ -13,3 +14,6 @@ try:
     faulty_function(5)
 except ZeroDivisionError as e:
     awlak.capture_exception(e, title="Test", severity=awlak.ERROR, tags=["math"])
+    # Only a workaround for standalone execution to prevent immediate exit
+    # TODO: Remove this in production code
+    time.sleep(3)
