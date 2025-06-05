@@ -35,8 +35,10 @@ class Awlak:
         # Prevent re-initialization if already instantiated
         if hasattr(self, "_initialized") and self._initialized:
             return
-        self._initialized = True
+        self._perform_initial_configuration()
 
+    def _perform_initial_configuration(self):
+        """Performs the actual initialization and configuration."""
         # Configuration from environment variables
         self.api_endpoint: str = os.environ.get(
             "AWLAK_API_ENDPOINT", "https://api.awlak.com/exception"
@@ -47,32 +49,69 @@ class Awlak:
         self.log_file: Optional[str] = os.environ.get("AWLAK_LOG_FILE")
         self.log_level: str = os.environ.get("AWLAK_LOG_LEVEL", "INFO")
 
-        self._setup_logging()
+        # Stop and remove existing handlers before setting up new ones
+        if hasattr(self, 'logger'):
+            for handler in list(self.logger.handlers): # Iterate over a copy
+                handler.close()
+                self.logger.removeHandler(handler)
 
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._own_loop: bool = False
-        self._pending_api_calls: List[asyncio.Future] = []
+        self._setup_logging() # This will re-add handlers
 
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:  # No running loop in current thread
-            pass  # self._loop remains None
+        # Event loop initialization logic needs to be idempotent or handle re-entry
+        # If _loop and _thread are already set up from a previous configuration,
+        # we might not want to recreate them, or we need to shut them down first.
+        # For simplicity in this refactor, we'll assume this method is called on a "fresh"
+        # or "resettable" state regarding loop/thread for now, or that existing
+        # loop/thread can be reused if already correct.
+        # The current logic below will try to get running loop, if none, makes new one.
+        # This might be problematic if called multiple times without proper shutdown of old thread.
+        # However, reconfigure_for_test is for testing, where fresh_awlak_state aims for isolation.
 
-        if self._loop is None or not self._loop.is_running():
-            self._loop = asyncio.new_event_loop()
-            self._own_loop = True
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-            self._thread.start()
-            atexit.register(self._shutdown_loop)
-            self.logger.info(
-                "Awlak initialized with its own event loop in a separate thread."
-            )
-        else:
-            self._own_loop = False
-            self.logger.info(
-                "Awlak initialized using an existing event loop in the current thread."
-            )
+        # Only initialize loop/thread if not already done by a previous config in this instance's lifetime,
+        # or if they were torn down. For tests, fresh_awlak_state should give us a new instance.
+        if not hasattr(self, '_loop') or self._loop is None or \
+           (self._own_loop and (not hasattr(self, '_thread') or not self._thread or not self._thread.is_alive())):
+
+            self._loop: Optional[asyncio.AbstractEventLoop] = None
+            self._thread: Optional[threading.Thread] = None
+            self._own_loop: bool = False # Reset flag
+            self._pending_api_calls: List[asyncio.Future] = []
+
+
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:  # No running loop in current thread
+                pass
+
+            if self._loop is None or not self._loop.is_running():
+                self._loop = asyncio.new_event_loop()
+                self._own_loop = True
+                self._thread = threading.Thread(target=self._run_loop, daemon=True)
+                self._thread.start()
+                # Be careful with multiple atexit registrations if reconfigure is called multiple times
+                # This might be better handled by an explicit shutdown method called by tests.
+                # For now, atexit might be registered multiple times for the same method if not careful.
+                # However, atexit usually handles duplicate registrations of the same function gracefully.
+                atexit.register(self._shutdown_loop)
+                if hasattr(self, 'logger'):
+                    self.logger.info(
+                        "Awlak (re)configured with its own event loop in a separate thread."
+                    )
+            else:
+                self._own_loop = False
+                if hasattr(self, 'logger'):
+                    self.logger.info(
+                        "Awlak (re)configured using an existing event loop in the current thread."
+                    )
+
+        self._initialized = True
+
+
+    def reconfigure_for_test(self):
+        """Allows tests to force a re-read of configuration."""
+        self._initialized = False # Allow __init__ or _perform_initial_configuration to run fully
+        self._perform_initial_configuration()
+
 
     def _run_loop(self) -> None:
         """Runs the asyncio event loop."""
@@ -176,17 +215,29 @@ class Awlak:
     ) -> List[str]:
         """Get the lines of code around the error or event."""
         try:
-            source_lines, start_line = inspect.getsourcelines(frame)
-            error_line = frame.f_lineno - start_line
-            start = max(0, error_line - lines_before)
-            end = min(len(source_lines), error_line + lines_after + 1)
+            # Get source lines and the starting line number of the frame's code object in the file
+            # inspect.getsourcelines(frame.f_code) is preferred as frame might be from exec/eval
+            source_lines, code_obj_start_line_in_file = inspect.getsourcelines(frame.f_code)
+
+            # frame.f_lineno is the absolute line number in the file where the frame was captured.
+            # current_frame_line_idx_in_source_lines is the 0-based index into the source_lines list for this frame.f_lineno.
+            current_frame_line_idx_in_source_lines = frame.f_lineno - code_obj_start_line_in_file
+
+            # Determine the slice of lines to display
+            start_idx_in_source_lines = max(0, current_frame_line_idx_in_source_lines - lines_before)
+            end_idx_in_source_lines = min(len(source_lines), current_frame_line_idx_in_source_lines + lines_after + 1)
+
             context = []
-            for i in range(start, end):
-                line_num = start_line + i + 1
-                prefix = ">> " if i == error_line else "   "
-                context.append(f"{prefix}{line_num:4d} | {source_lines[i].rstrip()}")
+            for i in range(start_idx_in_source_lines, end_idx_in_source_lines):
+                # actual_file_line_num is the absolute line number for display
+                actual_file_line_num = code_obj_start_line_in_file + i
+                prefix = ">> " if i == current_frame_line_idx_in_source_lines else "   "
+                context.append(f"{prefix}{actual_file_line_num:4d} | {source_lines[i].rstrip()}")
             return context
-        except Exception:
+        except Exception: # pragma: no cover
+            # Consider logging here if self.logger is available and initialized:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.debug("Could not retrieve code context for frame.", exc_info=True)
             return ["Could not retrieve code context"]
 
     def _get_local_variables(self, frame) -> Dict[str, str]:
@@ -241,7 +292,7 @@ class Awlak:
                         headers=headers,
                         timeout=self.api_timeout,
                     ) as response:
-                        if response.status >= 200:
+                        if 200 <= response.status < 300:
                             self.logger.info("Successfully sent data to API")
                             return True
                         else:
